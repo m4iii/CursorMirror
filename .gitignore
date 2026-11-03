@@ -1,0 +1,13 @@
+# Build output. The binary is attached to the release instead of living in git.
+*.exe
+*.pdb
+*.obj
+bin/
+obj/
+
+# Per-user settings written by the app next to the exe.
+CursorMirror.ini
+
+# Scratch files from --selftest / --shot runs.
+*.log
+_*.png
