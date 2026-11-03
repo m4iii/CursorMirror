@@ -14,8 +14,16 @@ namespace CursorMirror
 {
     internal static class IconFactory
     {
-        // Sizes Windows actually asks for, plus 256 for the Explorer "extra large" view.
-        private static readonly int[] Sizes = new int[] { 16, 20, 24, 32, 40, 48, 64, 128, 256 };
+        // Sizes the tray needs. 32bpp DIB frames are what System.Drawing.Icon can read,
+        // and they are bulky, so this list stays short: together they cost ~26 KB.
+        private static readonly int[] TraySizes = new int[] { 16, 20, 24, 32, 40, 48 };
+
+        // The embedded .ico additionally carries a 256px frame for Explorer's extra-large
+        // view. That one is stored as PNG: as a DIB it would be 270 KB on its own, which is
+        // 71% of the whole icon file. The shell reads PNG-in-ICO natively since Vista.
+        private static readonly int[] FileSizes = new int[] { 16, 20, 24, 32, 40, 48, 256 };
+
+        private const int PngThreshold = 128;
 
         public static Bitmap Render(int size)
         {
@@ -105,14 +113,25 @@ namespace CursorMirror
             return p;
         }
 
-        // Multi-resolution .ico. Frames are written as uncompressed 32bpp DIBs rather than
-        // PNG, because System.Drawing.Icon (and several shell paths) misread PNG frames.
+        // In-memory icon for the tray. DIB frames only: System.Drawing.Icon cannot decode
+        // PNG-compressed frames and would render garbage.
         public static byte[] BuildIco()
         {
+            return Build(TraySizes);
+        }
+
+        // .ico file for --makeicon and for embedding via /win32icon.
+        public static byte[] BuildFileIco()
+        {
+            return Build(FileSizes);
+        }
+
+        private static byte[] Build(int[] sizes)
+        {
             List<byte[]> frames = new List<byte[]>();
-            for (int i = 0; i < Sizes.Length; i++)
+            for (int i = 0; i < sizes.Length; i++)
             {
-                frames.Add(BuildDibFrame(Sizes[i]));
+                frames.Add(sizes[i] >= PngThreshold ? BuildPngFrame(sizes[i]) : BuildDibFrame(sizes[i]));
             }
 
             using (MemoryStream ico = new MemoryStream())
@@ -120,12 +139,12 @@ namespace CursorMirror
             {
                 w.Write((ushort)0);              // reserved
                 w.Write((ushort)1);              // type: icon
-                w.Write((ushort)Sizes.Length);
+                w.Write((ushort)sizes.Length);
 
-                int offset = 6 + 16 * Sizes.Length;
-                for (int i = 0; i < Sizes.Length; i++)
+                int offset = 6 + 16 * sizes.Length;
+                for (int i = 0; i < sizes.Length; i++)
                 {
-                    int s = Sizes[i];
+                    int s = sizes[i];
                     w.Write((byte)(s >= 256 ? 0 : s));
                     w.Write((byte)(s >= 256 ? 0 : s));
                     w.Write((byte)0);            // palette
@@ -144,6 +163,16 @@ namespace CursorMirror
 
                 w.Flush();
                 return ico.ToArray();
+            }
+        }
+
+        private static byte[] BuildPngFrame(int size)
+        {
+            using (Bitmap bmp = Render(size))
+            using (MemoryStream ms = new MemoryStream())
+            {
+                bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                return ms.ToArray();
             }
         }
 
@@ -202,7 +231,7 @@ namespace CursorMirror
 
         public static void SaveIco(string path)
         {
-            File.WriteAllBytes(path, BuildIco());
+            File.WriteAllBytes(path, BuildFileIco());
         }
     }
 }
