@@ -123,6 +123,16 @@ proc=mstsc,msrdc
 - **DPI**：进程声明 per-monitor-v2，坐标是物理像素
 - 只影响视觉，不注入任何输入，不接管鼠标
 
+## 托盘图标
+
+托盘图标不走 `System.Windows.Forms.NotifyIcon`，而是直接调 `Shell_NotifyIcon`——两者混用时图标会被外壳静默丢弃（程序照跑，托盘里就是没有），提权启动反而正常，很难自查。
+
+关键点：
+
+- `NOTIFYICON_VERSION_4` 下左键单击发的是 `NIN_SELECT (0x0400)`，不是 `WM_LBUTTONUP`。若两个都响应，菜单会被打开又立刻关掉，表现为"点了没反应"
+- 启动后调 `Shell_NotifyIconGetRect` 自检：返回 `hr == 0` 才算真的落在任务栏上，失败会写进日志
+- 监听 `TaskbarCreated` 消息，Explorer 重启后自动重新添加
+
 ## 构建
 
 ```powershell

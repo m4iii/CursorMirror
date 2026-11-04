@@ -59,6 +59,9 @@ namespace CursorMirror
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint RegisterWindowMessage(string name);
+
         public const uint MOD_ALT = 0x0001;
         public const uint MOD_CONTROL = 0x0002;
         public const uint MOD_NOREPEAT = 0x4000;
@@ -71,6 +74,67 @@ namespace CursorMirror
         public const int WM_DISPLAYCHANGE = 0x007E;
         public const int WM_SETTINGCHANGE = 0x001A;
         public const int WM_DPICHANGED = 0x02E0;
+
+        // Tray icon (Shell_NotifyIcon). We drive this directly instead of using
+        // WinForms' NotifyIcon: that class keeps its own hidden window and message
+        // context, which does not play well with this app's raw Win32 message loop
+        // (the icon silently never appeared in the shell).
+        public const int WM_APP = 0x8000;
+        public const int WM_CONTEXTMENU = 0x007B;
+        public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_RBUTTONUP = 0x0205;
+
+        public const int NIM_ADD = 0x00000000;
+        public const int NIM_MODIFY = 0x00000001;
+        public const int NIM_DELETE = 0x00000002;
+        public const int NIM_SETVERSION = 0x00000004;
+
+        public const int NIF_MESSAGE = 0x00000001;
+        public const int NIF_ICON = 0x00000002;
+        public const int NIF_TIP = 0x00000004;
+        public const int NIF_SHOWTIP = 0x00000080;
+
+        public const int NOTIFYICON_VERSION_4 = 4;
+
+        // Callback events delivered in LOWORD(lParam) when version 4 is set.
+        public const int NIN_SELECT = 0x0400;
+        public const int NIN_KEYSELECT = 0x0401;
+        public const int NIN_BALLOONUSERCLICK = 0x0405;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NOTIFYICONDATA
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public int uID;
+            public int uFlags;
+            public int uCallbackMessage;
+            public IntPtr hIcon;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szTip;
+            public int dwState;
+            public int dwStateMask;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szInfo;
+            public int uVersion;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string szInfoTitle;
+            public int dwInfoFlags;
+            public Guid guidItem;
+            public IntPtr hBalloonIcon;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NOTIFYICONIDENTIFIER
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public int uID;
+            public Guid guidItem;
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool Shell_NotifyIcon(int message, ref NOTIFYICONDATA data);
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        public static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER id, out RECT rect);
 
         public const int CURSOR_SHOWING = 0x00000001;
         public const int IDC_ARROW = 32512;
@@ -1227,7 +1291,14 @@ namespace CursorMirror
         private IntPtr lastKnownCursor;
         private CursorShape shape;
         private int refreshCounter;
-        private NotifyIcon tray;
+        // Native tray state. Kept as primitives rather than a NotifyIcon so the icon is
+        // owned by this app's own window and message loop.
+        private const int TRAY_ID = 1;
+        private const int TRAY_CALLBACK = Native.WM_APP + 1;
+        private static readonly uint taskbarCreatedMessage = Native.RegisterWindowMessage("TaskbarCreated");
+        private Icon trayIcon;
+        private bool trayAdded;
+        private string trayTip = "CursorMirror";
         private ModernMenu menu;
         private int lastLoggedSize;
         private string className;
@@ -1304,6 +1375,15 @@ namespace CursorMirror
 
         private IntPtr WindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
+            // "TaskbarCreated" is a runtime-registered message, so it cannot be a case label.
+            if (msg == taskbarCreatedMessage && msg != 0)
+            {
+                // Explorer restarted: the shell drops every icon, so put ours back.
+                trayAdded = false;
+                CreateTrayIcon();
+                return IntPtr.Zero;
+            }
+
             switch (msg)
             {
                 case Native.WM_TIMER:
@@ -1331,6 +1411,21 @@ namespace CursorMirror
                     HandleHotKey(wParam.ToInt32());
                     return IntPtr.Zero;
 
+                case TRAY_CALLBACK:
+                    {
+                        // With NOTIFYICON_VERSION_4 the event code is the low word of lParam
+                        // and the anchor point is packed into wParam.
+                        int evt = (int)(lParam.ToInt64() & 0xFFFF);
+                        if (evt == Native.NIN_SELECT || evt == Native.NIN_KEYSELECT ||
+                            evt == Native.WM_CONTEXTMENU)
+                        {
+                            ShowMenu(new Point((short)(wParam.ToInt64() & 0xFFFF),
+                                               (short)((wParam.ToInt64() >> 16) & 0xFFFF)));
+                        }
+                        return IntPtr.Zero;
+                    }
+
+                // Explorer restarted: the shell drops every icon, so put ours back.
                 case Native.WM_DISPLAYCHANGE:
                 case Native.WM_SETTINGCHANGE:
                 case Native.WM_DPICHANGED:
@@ -1664,25 +1759,82 @@ namespace CursorMirror
         {
             try
             {
-                tray = new NotifyIcon();
-                tray.Icon = MakeTrayIcon();
-                tray.Visible = true;
-                // The classic ContextMenuStrip renders with the 9x theme; we show our own
-                // Win11-style flyout instead, so suppress the built-in menu entirely.
-                tray.MouseUp += OnTrayMouseUp;
+                trayIcon = MakeTrayIcon();
+
+                Native.NOTIFYICONDATA data = new Native.NOTIFYICONDATA();
+                data.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
+                data.hWnd = hwnd;
+                data.uID = TRAY_ID;
+                data.uFlags = Native.NIF_ICON | Native.NIF_TIP |
+                              Native.NIF_MESSAGE | Native.NIF_SHOWTIP;
+                data.uCallbackMessage = TRAY_CALLBACK;
+                data.hIcon = trayIcon.Handle;
+                data.szTip = trayTip;
+                data.szInfo = string.Empty;
+                data.szInfoTitle = string.Empty;
+                data.guidItem = Guid.Empty;
+
+                trayAdded = Native.Shell_NotifyIcon(Native.NIM_ADD, ref data);
+                int err = Marshal.GetLastWin32Error();
+
+                if (!trayAdded)
+                {
+                    Program.Log("tray NIM_ADD failed, win32=" + err
+                        + " (" + new System.ComponentModel.Win32Exception(err).Message + ")");
+                    return;
+                }
+
+                // Version 4 delivers click events with the anchor point in wParam and
+                // shows the tooltip without needing a separate NIM_MODIFY dance.
+                data.uVersion = Native.NOTIFYICON_VERSION_4;
+                Native.Shell_NotifyIcon(Native.NIM_SETVERSION, ref data);
+
                 UpdateTrayText();
+
+                // Ask the shell where it put the icon. hr==0 means it really is on a
+                // taskbar; anything else means the shell silently dropped it, which is
+                // exactly the failure that looked like "no icon".
+                Native.NOTIFYICONIDENTIFIER id = new Native.NOTIFYICONIDENTIFIER();
+                id.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONIDENTIFIER));
+                id.hWnd = hwnd;
+                id.uID = TRAY_ID;
+                id.guidItem = Guid.Empty;
+
+                Native.RECT rect;
+                int hr = Native.Shell_NotifyIconGetRect(ref id, out rect);
+                string where = hr == 0
+                    ? ("rect=" + rect.Left + "," + rect.Top + "-" + rect.Right + "," + rect.Bottom)
+                    : ("hr=0x" + hr.ToString("X8"));
+                Program.Log("tray icon added, " + where);
             }
-            catch
+            catch (Exception ex)
             {
-                tray = null;
+                trayIcon = null;
+                trayAdded = false;
+                Program.Log("tray icon FAILED: " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
-        private void OnTrayMouseUp(object sender, MouseEventArgs e)
+        private void RemoveTrayIcon()
         {
-            if (e.Button != MouseButtons.Right && e.Button != MouseButtons.Left) return;
-            ShowMenu(Cursor.Position);
+            if (!trayAdded) return;
+
+            try
+            {
+                Native.NOTIFYICONDATA data = new Native.NOTIFYICONDATA();
+                data.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
+                data.hWnd = hwnd;
+                data.uID = TRAY_ID;
+                data.guidItem = Guid.Empty;
+                Native.Shell_NotifyIcon(Native.NIM_DELETE, ref data);
+            }
+            catch
+            {
+            }
+
+            trayAdded = false;
         }
+
 
         private void ShowMenu(Point screen)
         {
@@ -1744,11 +1896,31 @@ namespace CursorMirror
 
         private void UpdateTrayText()
         {
-            if (tray == null) return;
+            if (!trayAdded) return;
+
             string size = options.Level > 0 ? ("Lv" + options.Level) : "auto";
             string text = "CursorMirror - " + size + (enabled ? "" : " (paused)");
+            // szTip is 128 chars in NOTIFYICONDATA; the shell truncates at 63 anyway.
             if (text.Length > 63) text = text.Substring(0, 63);
-            tray.Text = text;
+            if (text == trayTip) return;
+            trayTip = text;
+
+            try
+            {
+                Native.NOTIFYICONDATA data = new Native.NOTIFYICONDATA();
+                data.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
+                data.hWnd = hwnd;
+                data.uID = TRAY_ID;
+                data.uFlags = Native.NIF_TIP | Native.NIF_SHOWTIP;
+                data.szTip = text;
+                data.szInfo = string.Empty;
+                data.szInfoTitle = string.Empty;
+                data.guidItem = Guid.Empty;
+                Native.Shell_NotifyIcon(Native.NIM_MODIFY, ref data);
+            }
+            catch
+            {
+            }
         }
 
         private static Icon MakeTrayIcon()
@@ -1784,12 +1956,11 @@ namespace CursorMirror
             Native.UnregisterHotKey(hwnd, HK_BIGGER);
             Native.UnregisterHotKey(hwnd, HK_SMALLER);
 
-            if (tray != null)
+            RemoveTrayIcon();
+            if (trayIcon != null)
             {
-                tray.Visible = false;
-                if (tray.ContextMenuStrip != null) tray.ContextMenuStrip.Dispose();
-                tray.Dispose();
-                tray = null;
+                trayIcon.Dispose();
+                trayIcon = null;
             }
 
             surface.Dispose();

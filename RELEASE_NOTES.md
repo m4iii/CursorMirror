@@ -4,6 +4,17 @@
 
 不需要管理员权限，不改远端，不装驱动。单文件免安装。
 
+## 修好了托盘图标不显示
+
+之前普通权限启动时程序在跑、托盘里却没有图标，用管理员启动反而正常。原因是托盘用 WinForms 的 `NotifyIcon`，而主循环是裸 Win32 的 `GetMessage`，两者窗口上下文对不上，`NIM_ADD` 被外壳静默丢弃。
+
+现在改为直接调 `Shell_NotifyIcon`，并加了两道自检：
+
+- 启动后调 `Shell_NotifyIconGetRect` 确认图标真的落在任务栏上，失败写进日志
+- 单击走 `NIN_SELECT`（v4 语义）；之前同时响应 `WM_LBUTTONUP` 和 `NIN_SELECT`，菜单被打开又立刻关闭，表现为"点了没反应"
+
+顺带监听 `TaskbarCreated`，Explorer 重启后图标自动回来。
+
 ## 这个版本做了什么
 
 - 光标用**矢量重绘**：造型取自 Windows 自带的 `C:\Windows\Cursors\*.svg`，坐标硬编码在 `CursorArt.cs`，一个 `CursorArt.Render(kind, size)` 搞定。放到 320px 时边缘依然锐利，不再是 64px 位图放大后的锯齿和灰边。
