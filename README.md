@@ -66,7 +66,9 @@ VectorCursor c = CursorArt.Render(CursorKind.Arrow, 320, null, 100);
 
 托盘菜单是自绘的 Win11 风格面板（圆角、胶囊开关、滑块），深色模式跟随系统。
 
-**标题栏右侧是总开关**：关掉就表示当前不用这个程序 —— 镜像光标立即消失，下面的选项全部变灰不可点，状态写入 `CursorMirror.ini`，下次启动保持。
+**标题栏右侧是总开关**：关掉就表示当前不用这个程序 —— 镜像光标立即消失，下面的选项全部变灰不可点。
+
+外观设置（大小、镜像、绘制范围）会自动缓存到 exe 同目录的 `CursorMirror.ini`，下次双击直接沿用。**启用/停用状态不缓存**，每次启动都是工作状态。
 
 ### 尺寸档位
 
@@ -103,17 +105,20 @@ CursorMirror.exe [--size auto|1..15] [--alpha 10..100] [--tint RRGGBB]
 
 ## 配置文件
 
-`CursorMirror.ini`（与 exe 同目录，首次修改设置后自动生成）：
+`CursorMirror.ini`（与 exe 同目录，**首次改动设置后自动生成**）：
 
 ```ini
-size=96
+size=7
 alpha=100
 flip=h
+vector=on
 mode=mstsc
 proc=mstsc,msrdc
 ```
 
-`size=auto` 表示跟随真实光标。
+- `size=auto` 表示跟随真实光标
+- 优先级：**命令行参数 > ini > 内置默认**。用 `--size 3` 启动不会覆盖 ini 里的值
+- 只缓存外观（大小、镜像、范围、透明度、染色），不缓存启用状态
 
 ## 已知边界
 
@@ -122,6 +127,13 @@ proc=mstsc,msrdc
 - **多显示器负坐标**：按物理像素处理，正常
 - **DPI**：进程声明 per-monitor-v2，坐标是物理像素
 - 只影响视觉，不注入任何输入，不接管鼠标
+
+### 置顶
+
+窗口带 `WS_EX_TOPMOST`，但**同样是 topmost 的窗口只要创建得更晚会盖住它**——输入法候选框就是典型。所以每 150 ms 重新断言一次 `HWND_TOPMOST`，被压住后能在 0.15 秒内抢回。
+
+不用每帧（8 ms）做，那样只会和外壳无谓地抢。
+
 
 ## 托盘图标
 

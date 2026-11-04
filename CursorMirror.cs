@@ -308,6 +308,22 @@ namespace CursorMirror
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+            int x, int y, int cx, int cy, uint flags);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetTickCount();
+
+        // A topmost window still loses to windows that are created topmost later (the IME
+        // candidate list, some notification popups). Re-asserting HWND_TOPMOST on a timer
+        // is the only reliable way to stay above them without a global hook.
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
+        public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_NOOWNERZORDER = 0x0200;
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
@@ -1002,6 +1018,8 @@ namespace CursorMirror
         public string Log = null;
 
         // Settings live next to the exe so a double-click keeps the last tuned values.
+        // Only appearance is persisted; paused/enabled is deliberately not, so the app
+        // always starts in its working state.
         public static string ConfigPath
         {
             get
@@ -1133,6 +1151,7 @@ namespace CursorMirror
         public static Options Parse(string[] args)
         {
             Options o = new Options();
+            // Cached appearance first, then let command-line flags override it.
             o.LoadFromConfig();
             for (int i = 0; i < args.Length; i++)
             {
@@ -1452,8 +1471,8 @@ namespace CursorMirror
             else if (id == HK_MODE)
             {
                 options.Mode = options.Mode == GateMode.Always ? GateMode.Mstsc : GateMode.Always;
-                options.SaveConfig();
                 lastCursorHandle = IntPtr.Zero;
+                options.SaveConfig();
                 UpdateTrayText();
             }
             else if (id == HK_QUIT)
@@ -1742,10 +1761,37 @@ namespace CursorMirror
             {
                 Native.ShowWindow(hwnd, Native.SW_SHOWNOACTIVATE);
                 visible = true;
+                ForceTopmost();
             }
 
             Native.UpdateLayeredWindow(hwnd, IntPtr.Zero, ref dst, ref size, surface.Hdc, ref src,
                 0, ref blend, Native.ULW_ALPHA);
+
+            // The IME candidate window and friends are topmost too and win by being created
+            // later, which hides the mirror cursor behind them. Push back periodically; doing
+            // it every frame (8 ms) would fight the shell for no gain.
+            uint now = Native.GetTickCount();
+            if (now - lastTopmostAssert >= TopmostIntervalMs)
+            {
+                ForceTopmost();
+                lastTopmostAssert = now;
+            }
+        }
+
+        private const uint TopmostIntervalMs = 150;
+        private uint lastTopmostAssert;
+
+        private void ForceTopmost()
+        {
+            try
+            {
+                Native.SetWindowPos(hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE |
+                    Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+            }
+            catch
+            {
+            }
         }
 
         private void Hide()
@@ -1862,6 +1908,7 @@ namespace CursorMirror
                     lastCursorHandle = IntPtr.Zero;
                     shape = null;
                     refreshCounter = 0;
+                    options.SaveConfig();
                 }
                 else
                 {
@@ -1875,17 +1922,18 @@ namespace CursorMirror
                 lastCursorHandle = IntPtr.Zero;
                 shape = null;
                 refreshCounter = 0;
+                options.SaveConfig();
             };
             model.GetOnlyMstsc = delegate { return options.Mode == GateMode.Mstsc; };
             model.SetOnlyMstsc = delegate(bool v)
             {
                 options.Mode = v ? GateMode.Mstsc : GateMode.Always;
                 lastCursorHandle = IntPtr.Zero;
+                options.SaveConfig();
             };
             model.OnExit = delegate { Native.DestroyWindow(hwnd); };
             model.OnCommit = delegate
             {
-                options.SaveConfig();
                 UpdateTrayText();
             };
 

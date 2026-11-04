@@ -214,21 +214,100 @@ namespace CursorMirror
             return Shapes.ContainsKey(kind);
         }
 
-        // Hotspot in canvas space, derived from where the real cursor's tip sits.
-        // Arrow and UpArrow anchor on their tip (the point that must land on the pointer);
-        // symmetric shapes anchor on the glyph centre, which is what Windows uses.
-        private static PointF Anchor(CursorKind kind, Shape shape, float scale)
+        // Hotspot in canvas space, measured from the painted pixels rather than from the
+        // geometry. The stroke widens the glyph past its control points (a miter join at
+        // the arrow's tip reaches a couple of pixels further out, and more as size grows),
+        // so a geometric anchor leaves the drawn tip short of the pointer and the mirror
+        // sits visibly off the real cursor.
+        private static void RasterAnchor(Bitmap bmp, CursorKind kind, out int hx, out int hy)
         {
-            RectangleF b = Bounds(shape);
+            int w = bmp.Width;
+            int h = bmp.Height;
 
-            switch (kind)
+            BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h),
+                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
             {
-                case CursorKind.Arrow:
-                    return new PointF(b.Left * scale, b.Top * scale);
-                case CursorKind.UpArrow:
-                    return new PointF((b.Left + b.Width / 2f) * scale, b.Top * scale);
-                default:
-                    return new PointF((b.Left + b.Width / 2f) * scale, (b.Top + b.Height / 2f) * scale);
+                const int Threshold = 8;
+                int stride = data.Stride;
+                byte[] buf = new byte[stride * h];
+                Marshal.Copy(data.Scan0, buf, 0, buf.Length);
+
+                int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
+                for (int y = 0; y < h; y++)
+                {
+                    int row = y * stride;
+                    for (int x = 0; x < w; x++)
+                    {
+                        if (buf[row + x * 4 + 3] < Threshold) continue;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+
+                if (maxX < 0)
+                {
+                    hx = w / 2;
+                    hy = h / 2;
+                    return;
+                }
+
+                switch (kind)
+                {
+                    case CursorKind.Arrow:
+                        {
+                            // Tip points up-left: the painted pixel closest to that corner
+                            // is the one that has to land on the pointer.
+                            int best = int.MaxValue;
+                            int bx = minX, by = minY;
+                            for (int y = minY; y <= maxY; y++)
+                            {
+                                int row = y * stride;
+                                for (int x = minX; x <= maxX; x++)
+                                {
+                                    if (buf[row + x * 4 + 3] < Threshold) continue;
+                                    int sum = x + y;
+                                    if (sum < best || (sum == best && y < by))
+                                    {
+                                        best = sum;
+                                        bx = x;
+                                        by = y;
+                                    }
+                                }
+                            }
+                            hx = bx;
+                            hy = by;
+                            break;
+                        }
+
+                    case CursorKind.UpArrow:
+                        {
+                            // Tip is the top edge, taken at its horizontal centre.
+                            int sum = 0, count = 0;
+                            int row = minY * stride;
+                            for (int x = minX; x <= maxX; x++)
+                            {
+                                if (buf[row + x * 4 + 3] < Threshold) continue;
+                                sum += x;
+                                count++;
+                            }
+                            hx = count > 0 ? (int)Math.Round((double)sum / count) : (minX + maxX) / 2;
+                            hy = minY;
+                            break;
+                        }
+
+                    default:
+                        // Symmetric glyphs are centred by Windows too.
+                        hx = (minX + maxX) / 2;
+                        hy = (minY + maxY) / 2;
+                        break;
+                }
+            }
+            finally
+            {
+                bmp.UnlockBits(data);
             }
         }
 
@@ -298,30 +377,13 @@ namespace CursorMirror
                 VectorCursor result = new VectorCursor();
                 result.Width = size;
                 result.Height = size;
-                PointF anchor = Anchor(kind, shape, scale);
-                result.HotspotX = Math.Max(0, Math.Min(size - 1, (int)Math.Round(anchor.X)));
-                result.HotspotY = Math.Max(0, Math.Min(size - 1, (int)Math.Round(anchor.Y)));
+                int hx, hy;
+                RasterAnchor(bmp, kind, out hx, out hy);
+                result.HotspotX = Math.Max(0, Math.Min(size - 1, hx));
+                result.HotspotY = Math.Max(0, Math.Min(size - 1, hy));
                 result.Pixels = ToPremultiplied(bmp, tint, alphaPercent);
                 return result;
             }
-        }
-
-        private static RectangleF Bounds(Shape shape)
-        {
-            float minX = float.MaxValue, minY = float.MaxValue;
-            float maxX = float.MinValue, maxY = float.MinValue;
-            for (int l = 0; l < shape.Loops.Length; l++)
-            {
-                PointF[] pts = shape.Loops[l];
-                for (int i = 0; i < pts.Length; i++)
-                {
-                    if (pts[i].X < minX) minX = pts[i].X;
-                    if (pts[i].Y < minY) minY = pts[i].Y;
-                    if (pts[i].X > maxX) maxX = pts[i].X;
-                    if (pts[i].Y > maxY) maxY = pts[i].Y;
-                }
-            }
-            return new RectangleF(minX, minY, maxX - minX, maxY - minY);
         }
 
         private static byte[] ToPremultiplied(Bitmap bmp, Color? tint, int alphaPercent)
